@@ -1,0 +1,63 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Environment/local config
+.env
+.venv/
+venv/
+
+# Training outputs and experiment artifacts
+outputs/
+logs/
+logs_*/
+lightning_logs/
+wandb/
+tensorboard/
+runs/
+checkpoints/
+ckpt/
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.joblib
+*.onnx
+
+# Data and generated datasets (non-source)
+adni/
+cheears/
+klg/
+womac/
+synthetic/
+data/
+datasets/
+
+# Generated analysis/plots/results
+results/
+results_*.csv
+metrics_*.csv
+reports/
+plots/
+figures/
+pareto_confidence/
+
+# Large binary/media artifacts
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.zip
+*.tar
+*.tar.gz
