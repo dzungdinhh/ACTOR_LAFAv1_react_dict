@@ -175,6 +175,18 @@ class GumbelActor(pl.LightningModule):
                 params.append(self.dictionary_mu_step)
         return params
 
+    def dictionary_parameters(self):
+        """Dictionary-only parameters for TTUR updates."""
+        if self.planner_mode != 'dictionary':
+            return []
+        if self.dict_mode == 'global':
+            return [self.dictionary_mu]
+        return [self.dictionary_mu_step]
+
+    def planner_non_dictionary_parameters(self):
+        """Planner parameters excluding dictionary logits."""
+        return list(self.planner_nn.parameters())
+
     def set_planner_temperature(self, tau):
         """Update planner sampling temperatures."""
         tau = float(tau)
@@ -269,6 +281,92 @@ class GumbelActor(pl.LightningModule):
         # the final gate thresholding still provides a hard forward mask.
         return soft
 
+    def planner_forward_dual(self, planner_input, valid_mask_g=None):
+        """
+        Forward planner pass returning both relaxed and hard plans.
+
+        Returns:
+            planner_logits: (B, *)
+            z_soft: relaxed group mask (B, T*num_groups)
+            z_hard: hard/ST group mask used for forward (B, T*num_groups)
+            details: dict with hard binary mask + template usage stats
+        """
+        planner_logits = self.planner_nn(planner_input)
+
+        if self.planner_mode != 'dictionary':
+            logits = planner_logits
+            if valid_mask_g is not None:
+                logits = logits.masked_fill(valid_mask_g == 0, float('-inf'))
+
+            z_soft = self.gumbel_sigmoid(logits, hard=False)
+            z_hard_bin = (z_soft > self.threshold).float()
+            z_hard = z_hard_bin + z_soft - z_soft.detach()
+            if valid_mask_g is not None:
+                z_soft = z_soft * valid_mask_g.float()
+                z_hard_bin = z_hard_bin * valid_mask_g.float()
+                z_hard = z_hard * valid_mask_g.float()
+            details = {
+                'z_groups_hard_binary': z_hard_bin,
+                'z_groups_raw_hard': z_soft,
+                'template_usage_counts': None,
+            }
+            return planner_logits, z_soft, z_hard, details
+
+        if self.dict_mode == 'global':
+            z_templates_soft = self._sample_template_weights(planner_logits, hard=False, dim=-1)
+            if self.dict_use_st:
+                z_templates_hard = self._st_hard(z_templates_soft, dim=-1)
+            else:
+                idx = torch.argmax(z_templates_soft, dim=-1, keepdim=True)
+                z_templates_hard = torch.zeros_like(z_templates_soft).scatter_(-1, idx, 1.0)
+
+            relaxed_templates = torch.sigmoid(self.dictionary_mu)
+            z_soft = torch.einsum('bk,ktg->btg', z_templates_soft, relaxed_templates)
+            z_raw_hard = torch.einsum('bk,ktg->btg', z_templates_hard, relaxed_templates)
+            z_soft = z_soft.reshape(-1, self.num_time * self.num_groups)
+            z_raw_hard = z_raw_hard.reshape(-1, self.num_time * self.num_groups)
+
+            usage_idx = torch.argmax(z_templates_hard.detach(), dim=-1).reshape(-1)
+            usage_counts = torch.bincount(
+                usage_idx, minlength=self.dict_num_templates,
+            ).to(z_soft.dtype)
+        else:
+            logits = planner_logits.reshape(-1, self.num_time, self.dict_num_templates)
+            z_templates_soft = self._sample_template_weights(logits, hard=False, dim=-1)
+            if self.dict_use_st:
+                z_templates_hard = self._st_hard(z_templates_soft, dim=-1)
+            else:
+                idx = torch.argmax(z_templates_soft, dim=-1, keepdim=True)
+                z_templates_hard = torch.zeros_like(z_templates_soft).scatter_(-1, idx, 1.0)
+
+            relaxed_templates = torch.sigmoid(self.dictionary_mu_step)
+            z_soft = torch.einsum('btk,kg->btg', z_templates_soft, relaxed_templates)
+            z_raw_hard = torch.einsum('btk,kg->btg', z_templates_hard, relaxed_templates)
+            z_soft = z_soft.reshape(-1, self.num_time * self.num_groups)
+            z_raw_hard = z_raw_hard.reshape(-1, self.num_time * self.num_groups)
+
+            usage_idx = torch.argmax(z_templates_hard.detach(), dim=-1).reshape(-1)
+            usage_counts = torch.bincount(
+                usage_idx, minlength=self.dict_num_templates,
+            ).to(z_soft.dtype)
+
+        if valid_mask_g is not None:
+            z_soft = z_soft * valid_mask_g.float()
+            z_raw_hard = z_raw_hard * valid_mask_g.float()
+
+        z_hard_bin = (z_raw_hard > self.threshold).float()
+        z_hard = z_hard_bin + z_raw_hard - z_raw_hard.detach()
+        if valid_mask_g is not None:
+            z_hard_bin = z_hard_bin * valid_mask_g.float()
+            z_hard = z_hard * valid_mask_g.float()
+
+        details = {
+            'z_groups_hard_binary': z_hard_bin,
+            'z_groups_raw_hard': z_raw_hard,
+            'template_usage_counts': usage_counts,
+        }
+        return planner_logits, z_soft, z_hard, details
+
     def planner_forward(self, planner_input, valid_mask_g=None, hard=True):
         """
         Forward planner pass returning group-level gates.
@@ -282,35 +380,12 @@ class GumbelActor(pl.LightningModule):
             planner_logits: raw planner output logits
             z_groups: planned group-level mask (B, T*num_groups)
         """
-        planner_logits = self.planner_nn(planner_input)
-
-        if self.planner_mode != 'dictionary':
-            logits = planner_logits
-            if valid_mask_g is not None:
-                logits = logits.masked_fill(valid_mask_g == 0, float('-inf'))
-            z_groups = self.gumbel_sigmoid(logits, hard=hard)
-            return planner_logits, z_groups
-
-        if self.dict_mode == 'global':
-            z_templates = self._sample_template_weights(planner_logits, hard=hard, dim=-1)
-            relaxed_templates = torch.sigmoid(self.dictionary_mu)
-            z_groups = torch.einsum('bk,ktg->btg', z_templates, relaxed_templates)
-            z_groups = z_groups.reshape(-1, self.num_time * self.num_groups)
-        else:
-            logits = planner_logits.reshape(-1, self.num_time, self.dict_num_templates)
-            z_templates = self._sample_template_weights(logits, hard=hard, dim=-1)
-            relaxed_templates = torch.sigmoid(self.dictionary_mu_step)
-            z_groups = torch.einsum('btk,kg->btg', z_templates, relaxed_templates)
-            z_groups = z_groups.reshape(-1, self.num_time * self.num_groups)
-
-        if valid_mask_g is not None:
-            z_groups = z_groups * valid_mask_g.float()
-
+        planner_logits, z_soft, z_hard, _ = self.planner_forward_dual(
+            planner_input, valid_mask_g=valid_mask_g,
+        )
         if hard:
-            z_hard = (z_groups > self.threshold).float()
-            z_groups = z_hard + z_groups - z_groups.detach()
-
-        return planner_logits, z_groups
+            return planner_logits, z_hard
+        return planner_logits, z_soft
 
     def dictionary_diversity_loss(self):
         """Pairwise cosine-similarity penalty across templates."""
@@ -335,13 +410,36 @@ class GumbelActor(pl.LightningModule):
             return torch.sigmoid(self.dictionary_mu).sum()
         return torch.sigmoid(self.dictionary_mu_step).sum()
 
-    def dictionary_regularization_loss(self):
+    def dictionary_regularization_loss(self, sparse_lambda_override=None):
         """Combined dictionary regularizer (diversity + sparsity)."""
         if self.planner_mode != 'dictionary':
             return torch.tensor(0.0, device=self.device)
         div = self.dict_div_lambda * self.dictionary_diversity_loss()
-        sparse = self.dict_sparse_lambda * self.dictionary_sparsity_loss()
+        sparse_lambda = self.dict_sparse_lambda
+        if sparse_lambda_override is not None:
+            sparse_lambda = float(sparse_lambda_override)
+        sparse = sparse_lambda * self.dictionary_sparsity_loss()
         return div + sparse
+
+    def clamp_dictionary_logits(self, min_val=-10.0, max_val=10.0):
+        """Clamp dictionary logits to avoid saturation/vanishing gradients."""
+        if self.planner_mode != 'dictionary':
+            return
+        with torch.no_grad():
+            if self.dict_mode == 'global':
+                self.dictionary_mu.clamp_(min_val, max_val)
+            else:
+                self.dictionary_mu_step.clamp_(min_val, max_val)
+
+    def dictionary_density(self):
+        """Fraction of positive dictionary logits."""
+        if self.planner_mode != 'dictionary':
+            return torch.tensor(0.0, device=self.device)
+        if self.dict_mode == 'global':
+            logits = self.dictionary_mu
+        else:
+            logits = self.dictionary_mu_step
+        return (logits > 0).float().mean()
 
     def initialize_dictionary(self, init_mode='random', masks_np=None,
                               eps=1e-4, seed=42, n_init=20):

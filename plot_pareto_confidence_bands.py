@@ -81,7 +81,11 @@ def main():
             }
 
     # Phase2 parse variant id
-    pat = re.compile(r'dict_(?P<variant>.+)_B(?P<B>\d+)_s(?P<seed>\d+)_p2')
+    pat = re.compile(
+        r'dict_(?P<variant>.+?)_B(?P<B>\d+)'
+        r'(?:_alr(?P<alr>[-+0-9.eE]+)_dlr(?P<dlr>[-+0-9.eE]+))?'
+        r'_s(?P<seed>\d+)_p2'
+    )
     grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     # grouped[ds][variant_id][cw] -> list of rows
     for r in phase2_rows:
@@ -94,6 +98,8 @@ def main():
         if cw is None:
             continue
         variant_id = f"{m.group('variant')}_B{m.group('B')}"
+        if m.group('alr') is not None and m.group('dlr') is not None:
+            variant_id += f"_alr{m.group('alr')}_dlr{m.group('dlr')}"
         grouped[ds][variant_id][cw].append(r)
 
     # Aggregate + plot

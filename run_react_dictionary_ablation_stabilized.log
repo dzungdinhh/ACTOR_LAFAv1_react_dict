@@ -1,0 +1,7 @@
+[2026-03-12T12:22:11.663833] stage=all datasets=['womac', 'klg', 'adni', 'ILIADD', 'cheears'] gpus=['0', '1', '2', '3'] include_variants=['v1_temp_anneal', 'v2_diversity', 'v3_sparsity', 'v4_timestep_dict', 'v5_kmeans_init', 'v6_st'] cost_weight_sweep=auto
+[phase2] womac best=('v4_timestep_dict', 100, 0.001, 0.0001) seeds=[42, 43, 44]
+[phase2] klg best=('v1_temp_anneal', 100, 0.001, 0.0001) seeds=[42, 43, 44]
+[phase2] adni best=('v3_sparsity', 100, 0.001, 0.0001) seeds=[42, 43, 44]
+[phase2] ILIADD best=('v6_st', 50, 0.0005, 1e-05) seeds=[42, 43, 44]
+[phase2] cheears best=('v4_timestep_dict', 10, 0.0005, 1e-05) seeds=[42, 43, 44]
+[2026-03-12T20:50:03.348734] complete

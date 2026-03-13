@@ -435,12 +435,16 @@ ACTOR_CONFIG.update({
     'dict_tau0': 1.0,                # initial Gumbel-Softmax temperature
     'dict_tau_min': 0.2,             # min annealed temperature
     'dict_tau_gamma': 1.0,           # set <1.0 to enable annealing
+    'dict_tau_decay': 0.95,          # per pseudo-epoch multiplicative decay
     'dict_div_lambda': 0.0,          # diversity regularizer weight
     'dict_sparse_lambda': 0.0,       # sparsity regularizer weight
+    'dict_sparse_warmup_frac': 0.3,  # initial epoch fraction with zero sparsity
     'dict_init': 'random',           # random | orthogonal | kmeans
     'dict_init_eps': 1e-4,           # clip epsilon before logit init
     'dict_kmeans_seed': 42,
     'dict_kmeans_n_init': 20,
+    'dict_lr': 1e-4,                 # TTUR dictionary learning rate
+    'grad_clip_norm': 1.0,           # gradient clipping threshold
 })
 
 ITERATIVE_ACTOR_CONFIG = {

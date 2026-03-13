@@ -13,10 +13,12 @@ fine-tuned jointly with the planner. Three safeguards prevent collapse:
      diverse acquisition patterns.
 """
 import argparse
+import csv
 import json
 import os
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -98,6 +100,70 @@ def _append_manifest(manifest_path, payload):
         os.makedirs(manifest_dir, exist_ok=True)
     with open(manifest_path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(payload, sort_keys=True) + '\n')
+
+
+def _make_run_artifact_dir(actor_save_path):
+    stem = Path(actor_save_path).stem
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(actor_save_path).parent / f'{stem}__run_{ts}'
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _init_epoch_log_csv(path):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow([
+            'epoch', 'global_step', 'train_cost_soft', 'eval_cost_hard', 'tau',
+            'dict_density', 'sparsity_weight', 'actor_grad_norm', 'dict_grad_norm',
+        ])
+
+
+def _append_epoch_log_csv(path, row):
+    with open(path, 'a', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(row)
+
+
+def _save_template_usage(path, usage_history):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(usage_history, f, indent=2, sort_keys=True)
+
+
+def _save_final_dictionary(actor, path):
+    if actor.planner_mode != 'dictionary':
+        return
+    if actor.dict_mode == 'global':
+        logits = actor.dictionary_mu.detach()
+        binary = (torch.sigmoid(logits) > 0.5).int().cpu().numpy()
+        b, t_steps, ng = binary.shape
+        header = ['template'] + [f't{t}_g{g}' for t in range(t_steps) for g in range(ng)]
+        rows = []
+        for i in range(b):
+            rows.append([i] + binary[i].reshape(-1).tolist())
+    else:
+        logits = actor.dictionary_mu_step.detach()
+        binary = (torch.sigmoid(logits) > 0.5).int().cpu().numpy()
+        b, ng = binary.shape
+        header = ['template'] + [f'g{g}' for g in range(ng)]
+        rows = []
+        for i in range(b):
+            rows.append([i] + binary[i].tolist())
+
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def _grad_norm(parameters):
+    sq_sum = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        sq_sum += float(torch.sum(g * g).item())
+    return float(sq_sum ** 0.5)
 
 
 def rollout_batch(actor, x, y, m_avail, device, num_time, num_feat,
@@ -187,7 +253,8 @@ def rollout_batch(actor, x, y, m_avail, device, num_time, num_feat,
 def _forward_loss(actor, x, y, mask, cur_t, device,
                   anchor_params, anchor_weight,
                   mask_aug_ratio=0.0,
-                  x_static=None, mask_static=None):
+                  x_static=None, mask_static=None,
+                  sparse_lambda=None):
     """Forward pass that computes the joint loss (planner + classifier)."""
     t_steps = actor.num_time
     d = actor.num_feat
@@ -203,6 +270,7 @@ def _forward_loss(actor, x, y, mask, cur_t, device,
     orig_mask_f = mask_t.float()
     orig_mask_g = actor.feat_mask_to_group_mask(orig_mask_f)
     mask_after_g = actor.after_cur_t_mask(cur_t_t, t_steps, ng, device).float()
+    future_mask_g = actor.after_cur_t_mask(cur_t_t + 1, t_steps, ng, device).float()
 
     # aux gates
     aux_acquired = None
@@ -222,9 +290,11 @@ def _forward_loss(actor, x, y, mask, cur_t, device,
     else:
         inp = torch.cat([x_masked, mask_t, time_emb], dim=1)
 
-    _, z_groups = actor.planner_forward(inp, hard=True)
+    _, z_groups_soft, z_groups_hard, plan_info = actor.planner_forward_dual(inp)
+    z_groups_hard_bin = plan_info['z_groups_hard_binary']
+    usage_counts = plan_info['template_usage_counts']
 
-    z_safe_g = z_groups * mask_after_g * (1.0 - orig_mask_g.detach())
+    z_safe_g = z_groups_hard * mask_after_g * (1.0 - orig_mask_g.detach())
     gated_groups = (orig_mask_g.detach() + z_safe_g).clamp(0, 1)
 
     gated_mask_feat = actor.expand_group_gates_to_feat_mask(gated_groups).clamp(0, 1)
@@ -246,9 +316,13 @@ def _forward_loss(actor, x, y, mask, cur_t, device,
 
     ce_loss = F.cross_entropy(y_hat[use], y_t[use].long())
 
-    # cost at group level
-    cost = (gated_groups * mask_after_g * actor.feature_costs_flat).sum() / bsz
-    cost_loss = actor.cost_weight * cost
+    # Cost-alignment: penalize only future-causal plan entries.
+    future_allowed = future_mask_g * (1.0 - orig_mask_g.detach())
+    real_future_plan_soft = z_groups_soft * future_allowed
+    real_future_plan_hard = z_groups_hard_bin * future_allowed
+    train_cost_soft = (real_future_plan_soft * actor.feature_costs_flat).sum() / bsz
+    eval_cost_hard = (real_future_plan_hard * actor.feature_costs_flat).sum() / bsz
+    cost_loss = actor.cost_weight * train_cost_soft
 
     # L2 anchor loss
     anchor_loss = torch.tensor(0.0, device=device)
@@ -257,36 +331,82 @@ def _forward_loss(actor, x, y, mask, cur_t, device,
             anchor_loss = anchor_loss + F.mse_loss(param, anchor_params[name])
     anchor_loss = anchor_weight * anchor_loss
 
-    dict_reg_loss = actor.dictionary_regularization_loss()
+    dict_reg_loss = actor.dictionary_regularization_loss(
+        sparse_lambda_override=sparse_lambda,
+    )
 
     loss = ce_loss + cost_loss + aux_cost_loss + anchor_loss + dict_reg_loss
 
-    return loss, ce_loss, cost, anchor_loss, dict_reg_loss
+    return (
+        loss,
+        ce_loss,
+        train_cost_soft,
+        eval_cost_hard,
+        anchor_loss,
+        dict_reg_loss,
+        usage_counts,
+    )
 
 
-def train_step(actor, optimizer, x, y, mask, cur_t, device,
+def train_step(actor, optimizer_actor, optimizer_dict, actor_params, dict_params,
+               x, y, mask, cur_t, device,
                anchor_params, anchor_weight, mask_aug_ratio,
-               x_static=None, mask_static=None):
+               x_static=None, mask_static=None,
+               sparse_lambda=None,
+               grad_clip_norm=1.0):
     """1 gradient update (planner + classifier)."""
     actor.train()
-    loss, ce_loss, cost, anchor_loss, dict_reg_loss = _forward_loss(
+    (
+        loss,
+        ce_loss,
+        train_cost_soft,
+        eval_cost_hard,
+        anchor_loss,
+        dict_reg_loss,
+        usage_counts,
+    ) = _forward_loss(
         actor, x, y, mask, cur_t, device,
         anchor_params=anchor_params,
         anchor_weight=anchor_weight,
         mask_aug_ratio=mask_aug_ratio,
         x_static=x_static, mask_static=mask_static,
+        sparse_lambda=sparse_lambda,
     )
 
-    optimizer.zero_grad()
+    optimizer_actor.zero_grad()
+    if optimizer_dict is not None:
+        optimizer_dict.zero_grad()
     loss.backward()
-    optimizer.step()
+
+    actor_grad_norm = 0.0
+    dict_grad_norm = 0.0
+    if actor_params:
+        actor_grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(actor_params, max_norm=grad_clip_norm).item(),
+        )
+    if optimizer_dict is not None and dict_params:
+        dict_grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(dict_params, max_norm=grad_clip_norm).item(),
+        )
+
+    optimizer_actor.step()
+    if optimizer_dict is not None:
+        optimizer_dict.step()
+        actor.clamp_dictionary_logits(-10.0, 10.0)
 
     return {
         'loss': loss.item(),
         'ce_loss': ce_loss.item(),
-        'cost': cost.item(),
+        'train_cost_soft': train_cost_soft.item(),
+        'eval_cost_hard': eval_cost_hard.item(),
         'anchor': anchor_loss.item(),
         'dict_reg': dict_reg_loss.item(),
+        'template_usage_counts': (
+            usage_counts.detach().cpu().tolist()
+            if usage_counts is not None else None
+        ),
+        'actor_grad_norm': actor_grad_norm,
+        'dict_grad_norm': dict_grad_norm,
     }
 
 
@@ -319,6 +439,10 @@ def main():
     parser.add_argument('--aux_cost_weight', type=float, default=None)
     parser.add_argument('--classifier_lr', type=float, default=None,
                         help='Learning rate for the classifier (default: 1e-4)')
+    parser.add_argument('--actor_lr', type=float, default=None,
+                        help='Learning rate for planner/actor parameters (default: config lr)')
+    parser.add_argument('--dict_lr', type=float, default=None,
+                        help='Learning rate for dictionary logits (TTUR, default: 1e-4)')
     parser.add_argument('--anchor_weight', type=float, default=None,
                         help='L2 anchor regularisation strength (default: 1.0)')
     parser.add_argument('--mask_aug_ratio', type=float, default=None,
@@ -350,13 +474,19 @@ def main():
     parser.add_argument('--dict_tau0', type=float, default=None)
     parser.add_argument('--dict_tau_min', type=float, default=None)
     parser.add_argument('--dict_tau_gamma', type=float, default=None)
+    parser.add_argument('--dict_tau_decay', type=float, default=None,
+                        help='Per-pseudo-epoch tau decay multiplier (epoch override schedule)')
     parser.add_argument('--dict_div_lambda', type=float, default=None)
     parser.add_argument('--dict_sparse_lambda', type=float, default=None)
+    parser.add_argument('--dict_sparse_warmup_frac', type=float, default=None,
+                        help='Fraction of pseudo-epochs with zero sparsity penalty before ramp')
     parser.add_argument('--dict_init', type=str, default=None, choices=['random', 'orthogonal', 'kmeans'])
     parser.add_argument('--dict_init_masks_path', type=str, default=None)
     parser.add_argument('--dict_init_eps', type=float, default=None)
     parser.add_argument('--dict_kmeans_seed', type=int, default=None)
     parser.add_argument('--dict_kmeans_n_init', type=int, default=None)
+    parser.add_argument('--grad_clip_norm', type=float, default=None,
+                        help='Global norm clip for actor/dict gradients')
 
     args = parser.parse_args()
 
@@ -382,10 +512,11 @@ def main():
     # Planner overrides
     for key in (
         'planner_mode', 'dict_mode', 'dict_num_templates', 'dict_use_st',
-        'dict_tau0', 'dict_tau_min', 'dict_tau_gamma',
+        'dict_tau0', 'dict_tau_min', 'dict_tau_gamma', 'dict_tau_decay',
         'dict_div_lambda', 'dict_sparse_lambda',
+        'dict_sparse_warmup_frac',
         'dict_init', 'dict_init_masks_path', 'dict_init_eps',
-        'dict_kmeans_seed', 'dict_kmeans_n_init',
+        'dict_kmeans_seed', 'dict_kmeans_n_init', 'grad_clip_norm',
     ):
         val = getattr(args, key)
         if val is not None:
@@ -393,8 +524,23 @@ def main():
 
     # Joint-specific hyper-parameters
     classifier_lr = args.classifier_lr or config.get('classifier_lr', JOINT_DEFAULTS['classifier_lr'])
+    actor_lr = args.actor_lr if args.actor_lr is not None else float(config.get('lr', 1e-3))
+    dict_lr = args.dict_lr if args.dict_lr is not None else float(config.get('dict_lr', 1e-4))
     anchor_weight = args.anchor_weight if args.anchor_weight is not None else config.get('anchor_weight', JOINT_DEFAULTS['anchor_weight'])
     mask_aug_ratio = args.mask_aug_ratio if args.mask_aug_ratio is not None else config.get('mask_aug_ratio', JOINT_DEFAULTS['mask_aug_ratio'])
+    tau0 = float(config.get('dict_tau0', config.get('gate_tau', 1.5)))
+    tau_min = float(config.get('dict_tau_min', 0.1))
+    tau_decay = float(config.get('dict_tau_decay', 0.95))
+    sparse_warmup_frac = float(config.get('dict_sparse_warmup_frac', 0.3))
+    grad_clip_norm = float(config.get('grad_clip_norm', 1.0))
+
+    config['actor_lr'] = actor_lr
+    config['dict_lr'] = dict_lr
+    config['dict_tau0'] = tau0
+    config['dict_tau_min'] = tau_min
+    config['dict_tau_decay'] = tau_decay
+    config['dict_sparse_warmup_frac'] = sparse_warmup_frac
+    config['grad_clip_norm'] = grad_clip_norm
 
     data_folder = args.data_folder if args.data_folder else DATA_FOLDER
 
@@ -489,14 +635,19 @@ def main():
         actor.aux_logits.requires_grad = False
         print("Forcing NO baseline features (fixed, not learned)")
 
-    planner_params = actor.planner_parameters()
+    planner_params = actor.planner_non_dictionary_parameters()
     if num_aux > 0 and args.baseline == 'learned':
         planner_params.append(actor.aux_logits)
+    dict_params = actor.dictionary_parameters()
+    actor_optim_params = list(planner_params) + list(actor.predictor.parameters())
 
-    optimizer = torch.optim.Adam([
-        {'params': planner_params, 'lr': config['lr']},
+    optimizer_actor = torch.optim.Adam([
+        {'params': planner_params, 'lr': actor_lr},
         {'params': list(actor.predictor.parameters()), 'lr': classifier_lr},
     ])
+    optimizer_dict = None
+    if dict_params:
+        optimizer_dict = torch.optim.Adam(dict_params, lr=dict_lr)
 
     total_batches = config.get('total_batches', 1000)
     warmup_batches = config.get('warmup_batches', 50)
@@ -506,6 +657,12 @@ def main():
 
     has_aux = num_aux > 0 and xs_orc is not None
 
+    run_dir = _make_run_artifact_dir(actor_save_path)
+    epoch_log_csv = run_dir / 'epoch_logs.csv'
+    template_usage_json = run_dir / 'template_usage.json'
+    final_dictionary_csv = run_dir / 'final_dictionary.csv'
+    _init_epoch_log_csv(epoch_log_csv)
+
     print(
         f"\nConfig: total={total_batches} warmup={warmup_batches} mix={oracle_mix} "
         f"cw={config['cost_weight']} acw={config['aux_cost_weight']} "
@@ -513,7 +670,7 @@ def main():
     )
     print(
         f"Joint: classifier_lr={classifier_lr} anchor_weight={anchor_weight} "
-        f"mask_aug={mask_aug_ratio} seed={args.seed}"
+        f"mask_aug={mask_aug_ratio} seed={args.seed} actor_lr={actor_lr} dict_lr={dict_lr}"
     )
 
     _append_manifest(args.manifest_path, {
@@ -535,19 +692,73 @@ def main():
         'seed': int(args.seed),
         'actor_save_path': actor_save_path,
         'csv_path': args.csv_path,
+        'run_dir': str(run_dir),
         'git_commit': _git_commit_hash(os.path.dirname(__file__)),
     })
 
     # Global step across entire self-iterative loop
     global_train_step = 0
+    steps_per_epoch = max(1, len(raw_loader))
+    total_pseudo_epochs = max(1, int(np.ceil(total_batches / steps_per_epoch)))
+    sparse_warmup_epochs = int(total_pseudo_epochs * sparse_warmup_frac)
+    sparse_target = float(config.get('dict_sparse_lambda', 0.0))
 
-    def _set_global_tau(step_idx):
-        tau0 = float(config.get('dict_tau0', config.get('gate_tau', 1.0)))
-        tau_min = float(config.get('dict_tau_min', tau0))
-        gamma = float(config.get('dict_tau_gamma', 1.0))
-        tau = max(tau_min, tau0 * (gamma ** step_idx))
-        actor.set_planner_temperature(tau)
-        return tau
+    def _epoch_from_step(step_idx):
+        return min(total_pseudo_epochs, (step_idx // steps_per_epoch) + 1)
+
+    def _tau_for_epoch(epoch_idx):
+        return max(tau_min, tau0 * (tau_decay ** max(epoch_idx - 1, 0)))
+
+    def _sparse_for_epoch(epoch_idx):
+        if actor.planner_mode != 'dictionary' or sparse_target <= 0:
+            return 0.0
+        if epoch_idx <= sparse_warmup_epochs:
+            return 0.0
+        ramp_denom = max(1, total_pseudo_epochs - sparse_warmup_epochs)
+        progress = min(1.0, (epoch_idx - sparse_warmup_epochs) / ramp_denom)
+        return sparse_target * progress
+
+    def _new_epoch_metrics():
+        usage = None
+        if actor.planner_mode == 'dictionary':
+            usage = np.zeros(actor.dict_num_templates, dtype=np.int64)
+        return {
+            'count': 0,
+            'train_cost_soft': 0.0,
+            'eval_cost_hard': 0.0,
+            'actor_grad_norm': 0.0,
+            'dict_grad_norm': 0.0,
+            'usage': usage,
+        }
+
+    template_usage_history = {}
+    current_epoch = _epoch_from_step(global_train_step)
+    epoch_tau = _tau_for_epoch(current_epoch)
+    epoch_sparse = _sparse_for_epoch(current_epoch)
+    actor.set_planner_temperature(epoch_tau)
+    epoch_metrics = _new_epoch_metrics()
+
+    def _flush_epoch(epoch_idx):
+        if epoch_metrics['count'] == 0:
+            return
+        n = float(epoch_metrics['count'])
+        dict_density = 0.0
+        if actor.planner_mode == 'dictionary':
+            dict_density = float(actor.dictionary_density().detach().cpu().item())
+            template_usage_history[str(epoch_idx)] = epoch_metrics['usage'].astype(int).tolist()
+            _save_template_usage(template_usage_json, template_usage_history)
+
+        _append_epoch_log_csv(epoch_log_csv, [
+            int(epoch_idx),
+            int(global_train_step),
+            epoch_metrics['train_cost_soft'] / n,
+            epoch_metrics['eval_cost_hard'] / n,
+            float(epoch_tau),
+            dict_density,
+            float(epoch_sparse),
+            epoch_metrics['actor_grad_norm'] / n,
+            epoch_metrics['dict_grad_norm'] / n,
+        ])
 
     # Oracle warm-up
     print(f"\nOracle warm-up ({warmup_batches} batches)...")
@@ -560,22 +771,41 @@ def main():
             ox, oy, om, ot = sample_oracle(x_orc, y_orc, m_orc, t_orc, bs)
             oxs, oms = None, None
 
-        tau = _set_global_tau(global_train_step)
+        step_epoch = _epoch_from_step(global_train_step)
+        if step_epoch != current_epoch:
+            _flush_epoch(current_epoch)
+            current_epoch = step_epoch
+            epoch_tau = _tau_for_epoch(current_epoch)
+            epoch_sparse = _sparse_for_epoch(current_epoch)
+            actor.set_planner_temperature(epoch_tau)
+            epoch_metrics = _new_epoch_metrics()
+
         metrics = train_step(
-            actor, optimizer, ox, oy, om, ot, device,
+            actor, optimizer_actor, optimizer_dict, actor_optim_params, dict_params,
+            ox, oy, om, ot, device,
             anchor_params=anchor_params,
             anchor_weight=anchor_weight,
             mask_aug_ratio=mask_aug_ratio,
             x_static=oxs, mask_static=oms,
+            sparse_lambda=epoch_sparse,
+            grad_clip_norm=grad_clip_norm,
         )
         global_train_step += 1
+        epoch_metrics['count'] += 1
+        epoch_metrics['train_cost_soft'] += metrics['train_cost_soft']
+        epoch_metrics['eval_cost_hard'] += metrics['eval_cost_hard']
+        epoch_metrics['actor_grad_norm'] += metrics['actor_grad_norm']
+        epoch_metrics['dict_grad_norm'] += metrics['dict_grad_norm']
+        if epoch_metrics['usage'] is not None and metrics['template_usage_counts'] is not None:
+            epoch_metrics['usage'] += np.asarray(metrics['template_usage_counts'], dtype=np.int64)
 
         if batch_idx % log_every == 0:
             print(
                 f"Batch {batch_idx:4d} (oracle): loss={metrics['loss']:.4f} "
-                f"ce={metrics['ce_loss']:.4f} cost={metrics['cost']:.2f} "
+                f"ce={metrics['ce_loss']:.4f} train_cost={metrics['train_cost_soft']:.2f} "
+                f"eval_cost={metrics['eval_cost_hard']:.2f} "
                 f"anchor={metrics['anchor']:.4f} dict_reg={metrics['dict_reg']:.4f} "
-                f"tau={tau:.4f}"
+                f"tau={epoch_tau:.4f}"
             )
 
     # Actor rollout + oracle mix
@@ -625,23 +855,45 @@ def main():
             m_x, m_y, m_m, m_t = r_x, r_y, r_m, r_t
             m_xs, m_ms = r_xs, r_ms
 
-        tau = _set_global_tau(global_train_step)
+        step_epoch = _epoch_from_step(global_train_step)
+        if step_epoch != current_epoch:
+            _flush_epoch(current_epoch)
+            current_epoch = step_epoch
+            epoch_tau = _tau_for_epoch(current_epoch)
+            epoch_sparse = _sparse_for_epoch(current_epoch)
+            actor.set_planner_temperature(epoch_tau)
+            epoch_metrics = _new_epoch_metrics()
+
         metrics = train_step(
-            actor, optimizer, m_x, m_y, m_m, m_t, device,
+            actor, optimizer_actor, optimizer_dict, actor_optim_params, dict_params,
+            m_x, m_y, m_m, m_t, device,
             anchor_params=anchor_params,
             anchor_weight=anchor_weight,
             mask_aug_ratio=mask_aug_ratio,
             x_static=m_xs, mask_static=m_ms,
+            sparse_lambda=epoch_sparse,
+            grad_clip_norm=grad_clip_norm,
         )
         global_train_step += 1
+        epoch_metrics['count'] += 1
+        epoch_metrics['train_cost_soft'] += metrics['train_cost_soft']
+        epoch_metrics['eval_cost_hard'] += metrics['eval_cost_hard']
+        epoch_metrics['actor_grad_norm'] += metrics['actor_grad_norm']
+        epoch_metrics['dict_grad_norm'] += metrics['dict_grad_norm']
+        if epoch_metrics['usage'] is not None and metrics['template_usage_counts'] is not None:
+            epoch_metrics['usage'] += np.asarray(metrics['template_usage_counts'], dtype=np.int64)
 
         if batch_idx % log_every == 0:
             print(
                 f"Batch {batch_idx:4d}: loss={metrics['loss']:.4f} "
-                f"ce={metrics['ce_loss']:.4f} cost={metrics['cost']:.2f} "
+                f"ce={metrics['ce_loss']:.4f} train_cost={metrics['train_cost_soft']:.2f} "
+                f"eval_cost={metrics['eval_cost_hard']:.2f} "
                 f"anchor={metrics['anchor']:.4f} dict_reg={metrics['dict_reg']:.4f} "
-                f"tau={tau:.4f}"
+                f"tau={epoch_tau:.4f}"
             )
+
+    _flush_epoch(current_epoch)
+    _save_final_dictionary(actor, final_dictionary_csv)
 
     # Eval
     actor.eval()
@@ -697,6 +949,12 @@ def main():
         'seed': int(args.seed),
         'global_train_step': int(global_train_step),
         'actor_save_path': actor_save_path,
+        'run_dir': str(run_dir),
+        'artifacts': {
+            'epoch_logs_csv': str(epoch_log_csv),
+            'template_usage_json': str(template_usage_json),
+            'final_dictionary_csv': str(final_dictionary_csv),
+        },
         'results': {
             'accuracy': float(results['accuracy']),
             'auroc': float(results['auroc']),

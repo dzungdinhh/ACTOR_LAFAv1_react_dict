@@ -50,6 +50,10 @@ PHASE2_CSV = ROOT / 'results_dict_ablation_phase2.csv'
 LOG_DIR = ROOT / 'logs_react_dict'
 MANIFEST_DIR = ROOT / 'manifests'
 CW_DECIMALS = 12
+TTUR_LR_GRID = [
+    (1e-3, 1e-4),
+    (5e-4, 1e-5),
+]
 
 VARIANT_ALIASES = {
     'temp_anneal': 'v1_temp_anneal',
@@ -179,6 +183,10 @@ def _cw_key(cw: float) -> float:
     return round(float(cw), CW_DECIMALS)
 
 
+def _fmt_lr(lr: float) -> str:
+    return f"{float(lr):g}"
+
+
 def _base_env(dataset: str, gpu_id: str) -> Dict[str, str]:
     return {
         'ACTOR_DATASET': dataset,
@@ -286,46 +294,51 @@ def _phase1_jobs(datasets: List[str], gpus: List[str], seed: int,
     for ds in datasets:
         for cw in DATASET_CW_GRID[ds]:
             for b in templates:
-                for v_name in include_variants:
-                    v_args = variants[v_name]
-                    gpu = gpus[idx % len(gpus)]
-                    idx += 1
+                for actor_lr, dict_lr in TTUR_LR_GRID:
+                    for v_name in include_variants:
+                        v_args = variants[v_name]
+                        gpu = gpus[idx % len(gpus)]
+                        idx += 1
+                        lr_tag = f"alr{_fmt_lr(actor_lr)}_dlr{_fmt_lr(dict_lr)}"
 
-                    cmd = [
-                        PYTHON_BIN, 'train_actor_iterative_joint.py',
-                        '--cost_weight', str(cw),
-                        '--baseline', 'none',
-                        '--planner_mode', 'dictionary',
-                        '--dict_mode', 'global',
-                        '--dict_num_templates', str(b),
-                        '--dict_tau0', '1.0', '--dict_tau_min', '1.0', '--dict_tau_gamma', '1.0',
-                        '--dict_div_lambda', '0.0', '--dict_sparse_lambda', '0.0',
-                        '--dict_init', 'random',
-                        '--csv_path', str(PHASE1_CSV),
-                        '--method_suffix', f'_dict_{v_name}_B{b}_s{seed}_p1',
-                        '--save_suffix', f'dict_{v_name}_B{b}_s{seed}_p1',
-                        '--data_folder', DATASET_SPLITS[ds],
-                        '--seed', str(seed),
-                        '--manifest_path', manifest,
-                    ]
+                        cmd = [
+                            PYTHON_BIN, 'train_actor_iterative_joint.py',
+                            '--cost_weight', str(cw),
+                            '--baseline', 'none',
+                            '--planner_mode', 'dictionary',
+                            '--dict_mode', 'global',
+                            '--dict_num_templates', str(b),
+                            '--actor_lr', _fmt_lr(actor_lr),
+                            '--dict_lr', _fmt_lr(dict_lr),
+                            '--dict_tau0', '1.5', '--dict_tau_min', '0.1', '--dict_tau_decay', '0.95',
+                            '--dict_div_lambda', '0.0', '--dict_sparse_lambda', '0.0',
+                            '--dict_sparse_warmup_frac', '0.3',
+                            '--dict_init', 'random',
+                            '--csv_path', str(PHASE1_CSV),
+                            '--method_suffix', f'_dict_{v_name}_B{b}_{lr_tag}_s{seed}_p1',
+                            '--save_suffix', f'dict_{v_name}_B{b}_{lr_tag}_s{seed}_p1',
+                            '--data_folder', DATASET_SPLITS[ds],
+                            '--seed', str(seed),
+                            '--manifest_path', manifest,
+                        ]
 
-                    # KMeans init masks path uses baseline eval artifacts.
-                    if v_name == 'v5_kmeans_init':
-                        masks_path = _eval_npz_path(ds, cw)
-                        if masks_path.exists():
-                            cmd[cmd.index('--dict_init') + 1] = 'kmeans'
-                            cmd.extend(['--dict_init_masks_path', str(masks_path)])
-                        else:
-                            # fallback keeps sweep running if baseline masks absent
-                            cmd[cmd.index('--dict_init') + 1] = 'orthogonal'
+                        # KMeans init masks path uses baseline eval artifacts.
+                        if v_name == 'v5_kmeans_init':
+                            masks_path = _eval_npz_path(ds, cw)
+                            if masks_path.exists():
+                                cmd[cmd.index('--dict_init') + 1] = 'kmeans'
+                                cmd.extend(['--dict_init_masks_path', str(masks_path)])
+                            else:
+                                # fallback keeps sweep running if baseline masks absent
+                                cmd[cmd.index('--dict_init') + 1] = 'orthogonal'
 
-                    for k, v in v_args.items():
-                        cmd.append(k)
-                        if v:
-                            cmd.append(v)
+                        for k, v in v_args.items():
+                            cmd.append(k)
+                            if v:
+                                cmd.append(v)
 
-                    name = f"p1_{ds}_cw{cw}_B{b}_{v_name}_s{seed}"
-                    jobs.append(Job(name=name, dataset=ds, gpu_id=gpu, env=_base_env(ds, gpu), commands=[cmd]))
+                        name = f"p1_{ds}_cw{cw}_B{b}_{lr_tag}_{v_name}_s{seed}"
+                        jobs.append(Job(name=name, dataset=ds, gpu_id=gpu, env=_base_env(ds, gpu), commands=[cmd]))
 
     return jobs
 
@@ -358,9 +371,15 @@ def _parse_temporal_baseline_scores(baseline_csv: Path, datasets: List[str]) -> 
     return baseline_scores
 
 
-def _parse_phase1_top2(phase1_csv: Path, baseline_csv: Path, datasets: List[str],
-                       include_variants: List[str]) -> Dict[str, List[Tuple[str, int]]]:
-    pattern = re.compile(r'dict_(?P<v>.+?)_B(?P<b>\d+)_s\d+_p1')
+def _parse_phase1_best(phase1_csv: Path, baseline_csv: Path, datasets: List[str],
+                       include_variants: List[str]) -> Dict[str, Tuple[str, int, float, float]]:
+    pattern_with_lr = re.compile(
+        r'dict_(?P<v>.+?)_B(?P<b>\d+)_alr(?P<alr>[-+0-9.eE]+)_dlr(?P<dlr>[-+0-9.eE]+)_s\d+_p1',
+    )
+    pattern_legacy = re.compile(
+        r'dict_(?P<v>.+?)_B(?P<b>\d+)_s\d+_p1',
+    )
+    default_actor_lr, default_dict_lr = TTUR_LR_GRID[0]
     scores = defaultdict(lambda: defaultdict(lambda: {'raw': [], 'delta': []}))
     baseline_scores = _parse_temporal_baseline_scores(baseline_csv, datasets)
 
@@ -374,13 +393,28 @@ def _parse_phase1_top2(phase1_csv: Path, baseline_csv: Path, datasets: List[str]
             if ds not in datasets:
                 continue
             method = (row.get('method') or '')
-            m = pattern.search(method)
-            if not m:
-                continue
-            v_name = m.group('v')
+            m = pattern_with_lr.search(method)
+            if m:
+                v_name = m.group('v')
+                if v_name not in include_variants:
+                    continue
+                b = int(m.group('b'))
+                alr = float(m.group('alr'))
+                dlr = float(m.group('dlr'))
+            else:
+                m = pattern_legacy.search(method)
+                if not m:
+                    continue
+                v_name = m.group('v')
+                if v_name not in include_variants:
+                    continue
+                b = int(m.group('b'))
+                # Backward compatibility for historical phase1 rows without LR tags.
+                alr = float(default_actor_lr)
+                dlr = float(default_dict_lr)
+
             if v_name not in include_variants:
                 continue
-            b = int(m.group('b'))
             try:
                 cw = _cw_key(float(row.get('cw') or 'nan'))
                 auroc = float(row.get('AUROC') or 'nan')
@@ -390,13 +424,13 @@ def _parse_phase1_top2(phase1_csv: Path, baseline_csv: Path, datasets: List[str]
             if not (cw == cw and auroc == auroc and auprc == auprc):
                 continue
             composite = 0.5 * (auroc + auprc)
-            scores[ds][(v_name, b)]['raw'].append(composite)
+            scores[ds][(v_name, b, alr, dlr)]['raw'].append(composite)
 
             baseline_at_cw = baseline_scores.get(ds, {}).get(cw, None)
             if baseline_at_cw is not None:
-                scores[ds][(v_name, b)]['delta'].append(composite - baseline_at_cw)
+                scores[ds][(v_name, b, alr, dlr)]['delta'].append(composite - baseline_at_cw)
 
-    top2 = {}
+    best_cfg = {}
     for ds in datasets:
         ranked = []
         for key, info in scores[ds].items():
@@ -415,71 +449,76 @@ def _parse_phase1_top2(phase1_csv: Path, baseline_csv: Path, datasets: List[str]
 
         ranked.sort(reverse=True, key=lambda x: (x[0], x[1], x[2]))
         if not ranked:
-            top2[ds] = []
+            best_cfg[ds] = None
             continue
-        top2[ds] = [k for _, _, _, k in ranked[:2]]
-    return top2
+        best_cfg[ds] = ranked[0][3]
+    return best_cfg
 
 
 def _phase2_jobs(datasets: List[str], gpus: List[str], seeds: List[int],
                  include_variants: List[str]) -> List[Job]:
-    top2 = _parse_phase1_top2(PHASE1_CSV, BASELINE_CSV, datasets, include_variants)
-    missing = [ds for ds in datasets if len(top2.get(ds, [])) == 0]
+    best_cfg = _parse_phase1_best(PHASE1_CSV, BASELINE_CSV, datasets, include_variants)
+    missing = [ds for ds in datasets if best_cfg.get(ds) is None]
     if missing:
         raise RuntimeError(
-            "Phase2 requires phase1 winners for every dataset. Missing top-2 for: "
+            "Phase2 requires phase1 winners for every dataset. Missing best config for: "
             + ', '.join(missing)
         )
 
     for ds in datasets:
-        print(f"[phase2] {ds} top2={top2[ds]} seeds={seeds}")
+        print(f"[phase2] {ds} best={best_cfg[ds]} seeds={seeds}")
 
     jobs = []
     manifest = str(MANIFEST_DIR / 'phase2_runs.jsonl')
     idx = 0
 
     for ds in datasets:
-        for v_name, b in top2.get(ds, []):
-            for s in seeds:
-                for cw in DATASET_CW_GRID[ds]:
-                    gpu = gpus[idx % len(gpus)]
-                    idx += 1
+        v_name, b, actor_lr, dict_lr = best_cfg[ds]
+        lr_tag = f"alr{_fmt_lr(actor_lr)}_dlr{_fmt_lr(dict_lr)}"
+        for s in seeds:
+            for cw in DATASET_CW_GRID[ds]:
+                gpu = gpus[idx % len(gpus)]
+                idx += 1
 
-                    cmd = [
-                        PYTHON_BIN, 'train_actor_iterative_joint.py',
-                        '--cost_weight', str(cw),
-                        '--baseline', 'none',
-                        '--planner_mode', 'dictionary',
-                        '--dict_mode', 'global',
-                        '--dict_num_templates', str(b),
-                        '--csv_path', str(PHASE2_CSV),
-                        '--method_suffix', f'_dict_{v_name}_B{b}_s{s}_p2',
-                        '--save_suffix', f'dict_{v_name}_B{b}_s{s}_p2',
-                        '--data_folder', DATASET_SPLITS[ds],
-                        '--seed', str(s),
-                        '--manifest_path', manifest,
-                    ]
+                cmd = [
+                    PYTHON_BIN, 'train_actor_iterative_joint.py',
+                    '--cost_weight', str(cw),
+                    '--baseline', 'none',
+                    '--planner_mode', 'dictionary',
+                    '--dict_mode', 'global',
+                    '--dict_num_templates', str(b),
+                    '--actor_lr', _fmt_lr(actor_lr),
+                    '--dict_lr', _fmt_lr(dict_lr),
+                    '--dict_tau0', '1.5', '--dict_tau_min', '0.1', '--dict_tau_decay', '0.95',
+                    '--dict_sparse_warmup_frac', '0.3',
+                    '--csv_path', str(PHASE2_CSV),
+                    '--method_suffix', f'_dict_{v_name}_B{b}_{lr_tag}_s{s}_p2',
+                    '--save_suffix', f'dict_{v_name}_B{b}_{lr_tag}_s{s}_p2',
+                    '--data_folder', DATASET_SPLITS[ds],
+                    '--seed', str(s),
+                    '--manifest_path', manifest,
+                ]
 
-                    # Restore key variant knobs.
-                    if v_name == 'v1_temp_anneal':
-                        cmd += ['--dict_tau0', '1.5', '--dict_tau_min', '0.2', '--dict_tau_gamma', '0.9995', '--no-dict_use_st']
-                    elif v_name == 'v2_diversity':
-                        cmd += ['--dict_div_lambda', '0.01', '--no-dict_use_st']
-                    elif v_name == 'v3_sparsity':
-                        cmd += ['--dict_sparse_lambda', '0.001', '--no-dict_use_st']
-                    elif v_name == 'v4_timestep_dict':
-                        cmd += ['--dict_mode', 'timestep', '--no-dict_use_st']
-                    elif v_name == 'v5_kmeans_init':
-                        masks_path = _eval_npz_path(ds, cw)
-                        if masks_path.exists():
-                            cmd += ['--dict_init', 'kmeans', '--dict_init_masks_path', str(masks_path), '--no-dict_use_st']
-                        else:
-                            cmd += ['--dict_init', 'orthogonal', '--no-dict_use_st']
-                    elif v_name == 'v6_st':
-                        cmd += ['--dict_use_st']
+                # Restore key variant knobs.
+                if v_name == 'v1_temp_anneal':
+                    cmd += ['--dict_tau0', '1.5', '--dict_tau_min', '0.1', '--dict_tau_decay', '0.95', '--no-dict_use_st']
+                elif v_name == 'v2_diversity':
+                    cmd += ['--dict_div_lambda', '0.01', '--no-dict_use_st']
+                elif v_name == 'v3_sparsity':
+                    cmd += ['--dict_sparse_lambda', '0.001', '--no-dict_use_st']
+                elif v_name == 'v4_timestep_dict':
+                    cmd += ['--dict_mode', 'timestep', '--no-dict_use_st']
+                elif v_name == 'v5_kmeans_init':
+                    masks_path = _eval_npz_path(ds, cw)
+                    if masks_path.exists():
+                        cmd += ['--dict_init', 'kmeans', '--dict_init_masks_path', str(masks_path), '--no-dict_use_st']
+                    else:
+                        cmd += ['--dict_init', 'orthogonal', '--no-dict_use_st']
+                elif v_name == 'v6_st':
+                    cmd += ['--dict_use_st']
 
-                    name = f"p2_{ds}_cw{cw}_{v_name}_B{b}_s{s}"
-                    jobs.append(Job(name=name, dataset=ds, gpu_id=gpu, env=_base_env(ds, gpu), commands=[cmd]))
+                name = f"p2_{ds}_cw{cw}_{v_name}_B{b}_{lr_tag}_s{s}"
+                jobs.append(Job(name=name, dataset=ds, gpu_id=gpu, env=_base_env(ds, gpu), commands=[cmd]))
 
     return jobs
 
@@ -491,7 +530,7 @@ def main():
                         default=['womac', 'klg', 'adni', 'ILIADD', 'cheears'])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--phase2_seeds', type=int, nargs='+', default=[42, 43, 44])
-    parser.add_argument('--templates', type=int, nargs='+', default=[10, 30, 50])
+    parser.add_argument('--templates', type=int, nargs='+', default=[10, 30, 50, 100])
     parser.add_argument('--cost_weight_sweep', type=str, default='auto',
                         help="Cost sweep mode. 'auto' uses the built-in dataset grids.")
     parser.add_argument('--include_variations', type=str, nargs='*', default=None,
